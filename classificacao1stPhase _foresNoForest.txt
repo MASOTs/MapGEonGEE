@@ -1,0 +1,387 @@
+
+//=====================================================================================================================
+// MASOT - Mapeamento de Serviços de Ecossistema a partir de Observações da Terra
+
+// Land cover classification and accuracy assessment for forest and non-forest areas
+
+// 1st Phase - binary classification                                              
+
+//=====================================================================================================================
+
+//This script does the following:
+// * Ingest Sentinel 2 image for 2018 (and 2022)
+// * Apply filters, masks and processes indices to compile all in a data-stack
+// * Performs a SVM classification with assessment of training accuracy
+// * Post-classification clean-up
+// * Exports results as assets and to the google drive
+
+//=====================================================================================================================
+
+
+
+///////////////////////////////////////////////////////////////
+//  * Map configuration                                      //
+///////////////////////////////////////////////////////////////
+
+Map.setCenter(-6.77, 41.80, 10);
+Map.setOptions('satellite');
+
+// Visualization parameters
+//************************************************************************** 
+var rgbVis = {
+  min: 0.0,
+  max: 3000,
+  bands: ['B4', 'B3', 'B2'],
+};
+
+var ndviVis = {
+  min:0.7, 
+  max:1,
+  bands: ['ndvi'],
+  palette: ['white', 'green']
+};
+
+
+
+///////////////////////////////////////////////////////////////
+//  * Sentinel-2 composite preparation for 2018              //
+///////////////////////////////////////////////////////////////
+
+
+// Function to remove pixels with clouds and snow from Sentinel-2 SR images
+//************************************************************************** 
+function maskCloudAndShadowsSR(image) {
+  var cloudProb = image.select('MSK_CLDPRB');
+  var snowProb = image.select('MSK_SNWPRB');
+  var cloud = cloudProb.lt(10);
+  var scl = image.select('SCL'); 
+  var shadow = scl.eq(3); // 3 = cloud shadow
+  var cirrus = scl.eq(10); // 10 = cirrus
+  // Cloud probability less than 10% or cloud shadow classification
+  var mask = cloud.and(cirrus.neq(1)).and(shadow.neq(1));
+  return image.updateMask(mask);
+}
+
+
+// Applying filters to Sentinel-2 SR images for 2018
+//************************************************************************** 
+var ROI = uniPais.filter(ee.Filter.eq('uniPais_cd', 'ToM'));
+
+var filtered = s2
+.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10)) 
+  .filter(ee.Filter.date('2018-01-01', '2019-01-01'))
+  .filter(ee.Filter.bounds(ROI))
+  .map(maskCloudAndShadowsSR)
+  .select('B.*');
+
+
+var composite2018 = filtered.median().clip(ROI);
+Map.addLayer(composite2018, rgbVis, 'Composite 2018');
+
+
+// Calculation and application of spectral indices
+//************************************************************************** 
+var addIndices = function(image) {
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename(['ndvi']);
+  var mndwi = image.normalizedDifference(['B3', 'B11']).rename(['mndwi']);
+  var savi = image.expression(
+      '(1 + L) * float(nir - red)/ (nir + red + L)',
+      {
+        nir: image.select('B8'),
+        red: image.select('B4'),
+        L: 0.5
+      }).rename(['savi']);
+  var evi = image.expression(
+      '2.5 * (nir - red) / (nir + 6 * red - 7.5 * blue + 1)',
+      {
+        nir: image.select('B8'),
+        red: image.select('B4'),
+        blue: image.select('B2')
+      }).rename(['evi']);
+  return image.addBands(ndvi).addBands(mndwi).addBands(savi).addBands(evi);
+};
+
+var composited = addIndices(composite2018);
+
+
+// Calculation of slope and elevation
+//************************************************************************** 
+var elev = alos.select('AVE_DSM').rename('elev');
+var slope = ee.Terrain.slope(alos.select('AVE_DSM')).rename('slope');
+
+var dataStack = composited.addBands(elev).addBands(slope);
+
+//print (dataStack, 'Data-stack 2018');
+
+Map.addLayer(composited, rgbVis, 'RGB');
+
+
+// Function to normalize image data. 
+//************************************************************************** 
+function normalize(image){
+  var bandNames = image.bandNames();
+  // Compute min and max of the image
+  var minDict = image.reduceRegion({
+    reducer: ee.Reducer.min(),
+    geometry: ROI,
+    scale: 10,
+    maxPixels: 1e9,
+    bestEffort: true,
+    tileScale: 16
+  });
+  var maxDict = image.reduceRegion({
+    reducer: ee.Reducer.max(),
+    geometry: ROI,
+    scale: 10,
+    maxPixels: 1e9,
+    bestEffort: true,
+    tileScale: 16
+  });
+  var mins = ee.Image.constant(minDict.values(bandNames));
+  var maxs = ee.Image.constant(maxDict.values(bandNames));
+
+  var normalized = image.subtract(mins).divide(maxs.subtract(mins));
+  return normalized;
+}
+
+var dataStackNorm = normalize(dataStack);
+
+
+//print (dataStackNorm, 'Data-stack Normalized 2018')
+//************************************************************************** 
+/*
+Export.image.toAsset({
+  image: dataStackNorm,
+  description: 's2_2018_dataStackNorm',
+  assetId: 's2_2018_dataStackNorm',
+  region: ROI,
+  scale: 10,
+  maxPixels: 1e13,
+  });
+*/
+
+
+
+///////////////////////////////////////////////////////////////
+//  * Data preparation for classification                    //
+///////////////////////////////////////////////////////////////
+
+//print (dataStackNorm2018.bandNames());
+
+
+// NDVI index visualization
+//************************************************************************** 
+Map.addLayer(dataStackNorm2018.clip(ROI), ndviVis, 'NDVI 2018');
+
+
+// Joining training points
+//************************************************************************** 
+var gcps = nonVegetation_2018.merge(vegetation_2018);
+//print (gcps.size())
+
+
+// Bands included in the model
+//************************************************************************** 
+var bands = ['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12',
+'ndvi','mndwi', 'savi', 'evi',
+'elev','slope'];
+
+
+// Selection of bands of interest and clip to geometry
+//************************************************************************** 
+var image = dataStackNorm2018.select(bands).clip(ROI);
+//print (image)
+
+
+// Add a random column
+//************************************************************************** 
+var gcpsPoints = gcps.randomColumn();
+//print (gcpsPoints)
+
+
+// Randomly divide the samples (70% training data, 30% validation) 
+//************************************************************************** 
+var trainingGcp = gcpsPoints.filter(ee.Filter.lt('random', 0.7)); 
+var validationGcp = gcpsPoints.filter(ee.Filter.gte('random', 0.7));
+
+
+// Variable printing
+//************************************************************************** 
+//print (trainingGcp);
+//print (validationGcp);
+
+
+// Sample assembly to run the model
+//************************************************************************** 
+var training = image.sampleRegions({
+  collection: trainingGcp, // conjunto de dados para treino
+  properties: ['landcover'], // propriedade usada
+  scale: 10,
+  tileScale: 16
+});
+
+
+
+///////////////////////////////////////////////////////////////
+// * SVM                                                     //
+///////////////////////////////////////////////////////////////
+
+
+// Trainning of the SVM algorithm
+//************************************************************************** 
+var classifierSVM = ee.Classifier.libsvm({
+  kernelType: 'RBF',  // Radial basis function kernel
+  gamma: 0.5,         // Gamma parameter
+  cost: 10            // Cost parameter
+}).train({
+  features: training,
+  classProperty: 'landcover',
+  inputProperties: bands
+});
+
+
+// Image classification
+//************************************************************************** 
+var classified = image.classify(classifierSVM);
+
+Map.addLayer(classified, {min: 0, max: 1, 
+              palette: ['gray', 'green']}, 
+              'SVM classified 2018');
+
+
+// Evaluation of model accuracy
+//************************************************************************** 
+var test = classified.sampleRegions({
+  collection: validationGcp,
+  properties: ['landcover'],
+  scale: 10,
+  tileScale: 16
+});
+
+var confusionMatrix = test.errorMatrix('landcover', 'classification');
+
+print('Confusion Matrix SVM 2018', confusionMatrix);
+print('Test Accuracy SVM 2018:', confusionMatrix.accuracy());
+
+// Evaluation metrics calculation
+//************************************************************************** 
+print('Producers Accuracy SVM 2018:', confusionMatrix.producersAccuracy());
+print('Consumers Accuracy SVM 2018:', confusionMatrix.consumersAccuracy());
+print('Kappa SVM 2018:', confusionMatrix.kappa());
+
+
+// Accuracy evaluation results export as CSV
+//************************************************************************** 
+var fc = ee.FeatureCollection([
+  ee.Feature(null, {
+    'Confusion Matrix SVM': confusionMatrix.accuracy(),
+    'Test Accuracy SVM': confusionMatrix.array(),
+    'Producers Accuracy SVM': confusionMatrix.producersAccuracy(),
+    'Consumers Accuracy SVM': confusionMatrix.consumersAccuracy(),
+    'Kappa SVM': confusionMatrix.kappa()
+  })
+]);
+
+Export.table.toDrive({
+  collection: fc,
+  description: 'Accuracy_Export_2018_SVM',
+  folder: 'earthEngine',
+  fileNamePrefix: 'accuracy_2018_svm',
+  fileFormat: 'CSV'
+});
+
+
+
+//************************************************************************** 
+// Post process by clustering
+//************************************************************************** 
+
+// Cluster using Unsupervised Clustering methods
+//************************************************************************** 
+var seeds = ee.Algorithms.Image.Segmentation.seedGrid(5);
+
+var snic = ee.Algorithms.Image.Segmentation.SNIC({
+  image: image, 
+  compactness: 0,
+  connectivity: 4,
+  neighborhoodSize: 10,
+  size: 2,
+  seeds: seeds
+});
+
+var clusters = snic.select('clusters');
+
+
+// Assign class to each cluster based on 'majority' voting (using ee.Reducer.mode()
+//************************************************************************** 
+var smoothed = classified.addBands(clusters);
+
+var clusterMajority = smoothed.reduceConnectedComponents({
+  reducer: ee.Reducer.mode(),
+  labelBand: 'clusters'
+});
+
+Map.addLayer(clusterMajority, {min: 0, max: 1, 
+              palette: ['gray', 'green']},
+              'Processed using Clusters');
+
+              
+
+//************************************************************************** 
+// Post process by replacing isolated pixels with surrounding value
+//************************************************************************** 
+
+
+// Patch sizes count
+//************************************************************************** 
+var patchsize = clusterMajority.connectedPixelCount(40, false);
+
+
+// Majority filter run
+//************************************************************************** 
+var filtered = clusterMajority.focal_mode({
+    radius: 10,
+    kernelType: 'square',
+    units: 'meters',
+}); 
+  
+  
+// Updated image with majority filter where patch size is small
+//************************************************************************** 
+var connectedClassified =  clusterMajority.where(patchsize.lt(25),filtered);
+
+Map.addLayer(connectedClassified, {min: 0, max: 1, 
+              palette: ['gray', 'green']},
+              'Processed using Connected Pixels');
+
+
+              
+//************************************************************************** 
+// Classification results export
+//************************************************************************** 
+
+/*
+//export as asset
+//************************************************************************** 
+Export.image.toAsset({
+  image: connectedClassified,
+  description: 'S2_2018_1aClassif_1ToM_SVM',
+  assetId: 'S2_2018_1aClassif_1ToM_SVM',
+  region: ROI,
+  scale: 10,
+  maxPixels: 1e13,
+  });
+*/
+/*
+//export to G.Drive
+//************************************************************************** 
+Export.image.toDrive({
+  image: connectedClassified,
+  description: 'S2_2018_1aClassif_1ToM_SVM',
+  region: ROI,
+  folder: 'earthEngine',
+  scale: 10,
+  maxPixels: 1e13,
+  crs: 'EPSG:3763',
+  });
+*/

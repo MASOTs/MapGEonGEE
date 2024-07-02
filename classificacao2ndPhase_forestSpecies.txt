@@ -1,0 +1,349 @@
+//=====================================================================================================================
+// MASOT - Mapeamento de Serviços de Ecossistema a partir de Observações da Terra
+
+// Land cover classification and accuracy assessment for different forest species 
+
+// 2nd Phase - 7 class classification                                              
+
+//=====================================================================================================================
+
+//This script does the following:
+// * Ingest Sentinel 2 image for 2018 (and 2022)
+// * Apply filters, masks and processes indices to compile all in a data-stack
+// * Performs a SVM classification with assessment of training accuracy
+// * Post-classification clean-up
+// * Exports results as assets and to the google drive
+
+//=====================================================================================================================
+
+///////////////////////////////////////////////////////////////
+//  * Map configuration                                      //
+///////////////////////////////////////////////////////////////
+
+Map.setCenter(-6.77, 41.80, 9);
+Map.setOptions('satellite');
+
+// Visualization parameters
+//************************************************************************** 
+var rgbVis = {
+  min: 0.0,
+  max: 0.2,
+  bands: ['B4', 'B3', 'B2'],
+};
+
+var paletteVis =  ['#c51b7d','#e9a3c9','#fde0ef','#e6f5d0','#a1d76a','#4d9221'];
+
+var paletteClassif = ['#b35806','#f1a340','#fee0b6','#d8daeb','#998ec3','#542788'];
+
+var forestsVis = {
+  classification: ['1'], 
+  palette: ['green']
+};
+
+
+//Filter the ROI
+//************************************************************************** 
+var ROI = uniPais.filter(ee.Filter.eq('uniPais_cd', 'ToM'));
+
+var visParamsROI = {'color': 'red'};
+Map.addLayer(ROI, visParamsROI, 'ROI');
+
+
+// Create a mask from classification
+//************************************************************************** 
+var forestMask = Classif_1ToM2018.eq(1);
+var forests2018 = Classif_1ToM2018.updateMask(forestMask);
+
+
+//Map.addLayer(forests, forestsVis, 'Forests', true)
+//************************************************************************** 
+Map.addLayer(forests2018, forestsVis, 'Vegetation area 2018', false);
+
+
+// Mask the data stack with the forest mask
+//************************************************************************** 
+var dataStackMasked = dataStack2018.updateMask(forestMask);
+print(dataStackMasked);
+
+
+// Visualize the result
+//************************************************************************** 
+Map.addLayer(dataStackMasked, rgbVis, "RGB Forest Mask", false);
+
+
+
+///////////////////////////////////////////////////////////////
+//  * Data preparation for classification                    //
+///////////////////////////////////////////////////////////////
+
+
+// Joining training points
+//************************************************************************** 
+var gcps = eucalyptus2018.merge(otherBroadleaves2018).merge(corkOak2018).merge(holmOak2018).merge(otherConiferours2018)
+.merge(maritimePine2018).merge(stonePine2018);
+//print (gcps.size())
+
+
+// Bands included in the model
+//************************************************************************** 
+var bands = ['B2','B3','B4','B5','B6',
+'B7','B8','B8A',
+'B11','B12',
+'ndvi','mndwi', 'elev','slope'];
+
+
+// Selection of bands of interest and clip to geometry
+//************************************************************************** 
+var image = dataStack2018.select(bands).clip(ROI);
+//print (image)
+
+
+// Add a random column
+//************************************************************************** 
+var gcpsPoints = gcps.randomColumn();
+print (gcpsPoints);
+
+
+// Randomly divide the samples (70% training data, 30% validation) 
+var trainingGcp = gcpsPoints.filter(ee.Filter.lt('random', 0.7));
+var validationGcp = gcpsPoints.filter(ee.Filter.gte('random', 0.7));
+
+
+// Variable printing
+//print (trainingGcp);
+//print (validationGcp);
+
+
+// // Sample assembly to run the model
+//************************************************************************** 
+var training = image.sampleRegions({
+  collection: trainingGcp, 
+  properties: ['landcover'], 
+  scale: 10,
+  tileScale: 16
+});
+
+//print(training)
+
+///////////////////////////////////////////////////////////////
+// * SVM Model                                               //
+///////////////////////////////////////////////////////////////
+
+
+// Trainning of the SVM algorithm
+//**************************************************************************
+var classifierSVM = ee.Classifier.libsvm({
+  kernelType: 'RBF',  // Radial basis function kernel
+  gamma: 1.8,         // Gamma parameter
+  cost: 60            // Cost parameter
+}).train({
+  features: training,
+  classProperty: 'landcover',
+  inputProperties: bands
+});
+
+// Image classification
+//************************************************************************** 
+var classified = image.classify(classifierSVM);
+
+
+// Mask the classified image with the forest mask
+//**************************************************************************
+var classifiedMasked = classified.updateMask(forestMask);
+Map.addLayer(classifiedMasked, {min: 0, max: 5, palette: paletteClassif},'SVM Forest classified 2018');
+
+
+// Evaluation of model accuracy
+//**************************************************************************
+var test = classifiedMasked.sampleRegions({
+  collection: validationGcp,
+  properties: ['landcover'],
+  scale: 10,
+  tileScale: 16
+});
+
+var confusionMatrix = test.errorMatrix('landcover', 'classification');
+
+print('Confusion Matrix SVM', confusionMatrix);
+print('Test Accuracy SVM:', confusionMatrix.accuracy());
+
+
+// Evaluation metrics calculation
+//**************************************************************************
+print('Producers Accuracy SVM:', confusionMatrix.producersAccuracy());
+print('Consumers Accuracy SVM:', confusionMatrix.consumersAccuracy());
+print('Kappa SVM:', confusionMatrix.kappa());
+
+
+// Accuracy evaluation results export as CSV
+//************************************************************************** 
+var fc = ee.FeatureCollection([
+  ee.Feature(null, {
+    'Confusion Matrix SVM': confusionMatrix.accuracy(),
+    'Test Accuracy SVM': confusionMatrix.array(),
+    'Producers Accuracy SVM': confusionMatrix.producersAccuracy(),
+    'Consumers Accuracy SVM': confusionMatrix.consumersAccuracy(),
+    'Kappa SVM': confusionMatrix.kappa()
+  })
+  ]);
+
+
+Export.table.toDrive({
+  collection: fc,
+  description: 'accuracyExport_2aClassif_1ToM2018',
+  folder: 'earthEngine',
+  fileNamePrefix: 'accuracy_2aClassif_1ToM2018',
+  fileFormat: 'CSV'
+});
+
+
+
+///////////////////////////////////////////////////////////////
+// * Hyperparameters tuning                                  //
+///////////////////////////////////////////////////////////////
+
+
+// Define the range of values for the hyperparameters
+//**************************************************************************
+var kernelTypes = ['linear', 'poly', 'rbf', 'sigmoid'];
+var gammas = [0.1, 1, 10];
+var costs = [1, 10, 100];
+
+
+// Perform hyperparameter tuning
+//**************************************************************************
+var accuracies = [];
+for (var i = 0; i < kernelTypes.length; i++) {
+  for (var j = 0; j < gammas.length; j++) {
+    for (var k = 0; k < costs.length; k++) {
+      var classifier = ee.Classifier.libsvm({
+        kernelType: kernelTypes[i],
+        gamma: gammas[j],
+        cost: costs[k]
+      }).train({
+        features: training,
+        classProperty: 'landcover',
+        inputProperties: bands
+      });
+
+      var validationClassified = validationGcp.classify(classifier);
+      var errorMatrix = validationGcp.errorMatrix('landcover', 'classification');
+      var accuracy = errorMatrix.accuracy();
+
+      accuracies.push({
+        kernelType: kernelTypes[i],
+        gamma: gammas[j],
+        cost: costs[k],
+        accuracy: accuracy
+      });
+    }
+  }
+}
+
+// Sort the accuracies based on the accuracy value
+//**************************************************************************
+accuracies.sort(function(a, b) {
+  return b.accuracy - a.accuracy;
+});
+
+// Print the best hyperparameters and accuracy
+//**************************************************************************
+print('Best Hyperparameters:', accuracies[0]);
+
+
+
+//************************************************************************** 
+// Post process by clustering
+//************************************************************************** 
+
+
+// Cluster using Unsupervised Clustering methods
+//************************************************************************** 
+var seeds = ee.Algorithms.Image.Segmentation.seedGrid(5);
+
+var snic = ee.Algorithms.Image.Segmentation.SNIC({
+  image: classifiedMasked, 
+  compactness: 0,
+  connectivity: 4,
+  neighborhoodSize: 10,
+  size: 2,
+  seeds: seeds
+});
+
+var clusters = snic.select('clusters');
+
+
+// Assign class to each cluster based on 'majority' voting (using ee.Reducer.mode()
+//************************************************************************** 
+var smoothed = classifiedMasked.addBands(clusters);
+
+var clusterMajority = smoothed.reduceConnectedComponents({
+  reducer: ee.Reducer.mode(),
+  labelBand: 'clusters'
+});
+
+Map.addLayer(clusterMajority, {min: 0, max: 5, 
+              palette: paletteClassif},
+              'Forest species classified 2018 post-processed clustered', false);
+
+
+
+//************************************************************************** 
+// Post process by replacing isolated pixels with surrounding value
+//************************************************************************** 
+
+
+// Patch sizes count
+//**************************************************************************
+var patchsize = clusterMajority.connectedPixelCount(40, false);
+
+
+// Majority filter run
+//**************************************************************************
+var filtered = clusterMajority.focal_mode({
+    radius: 10,
+    kernelType: 'square',
+    units: 'meters',
+}); 
+  
+  
+// Updated image with majority filter where patch size is small
+//************************************************************************** 
+var connectedClassified =  clusterMajority.where(patchsize.lt(25),filtered);
+
+Map.addLayer(connectedClassified, {min: 0, max: 5, 
+              palette: paletteClassif},
+              'Forest species classified 2018 post-processed');
+
+
+
+//************************************************************************** 
+// Classification results export
+//************************************************************************** 
+
+/*
+//export original to G.Drive
+//************************************************************************** 
+Export.image.toDrive({
+  image: classifiedMasked,
+  description: 'S2_2018_2aClassif_1ToM_original',
+  region: ROI,
+  folder: 'earthEngine',
+  scale: 10,
+  maxPixels: 1e13,
+  crs: 'EPSG:3763',
+  });
+
+  
+//export post-processed to G.Drive
+//************************************************************************** 
+Export.image.toDrive({
+  image: connectedClassified,
+  description: 'S2_2018_2aClassif_1ToM_postProcess',
+  region: ROI,
+  folder: 'earthEngine',
+  scale: 10,
+  maxPixels: 1e13,
+  crs: 'EPSG:3763',
+  });
+
