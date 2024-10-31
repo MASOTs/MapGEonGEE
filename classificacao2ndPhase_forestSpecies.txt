@@ -1,10 +1,4 @@
-//=====================================================================================================================
-// MASOT - Mapeamento de Serviços de Ecossistema a partir de Observações da Terra
-
-// Land cover classification and accuracy assessment for different forest species 
-
-// 2nd Phase - 7 class classification                                              
-
+Multiclass Classification: Land cover classification and accuracy assessment for seven forest types
 //=====================================================================================================================
 
 //This script does the following:
@@ -15,31 +9,6 @@
 // * Exports results as assets and to the google drive
 
 //=====================================================================================================================
-
-///////////////////////////////////////////////////////////////
-//  * Map configuration                                      //
-///////////////////////////////////////////////////////////////
-
-Map.setCenter(-6.77, 41.80, 9);
-Map.setOptions('satellite');
-
-// Visualization parameters
-//************************************************************************** 
-var rgbVis = {
-  min: 0.0,
-  max: 0.2,
-  bands: ['B4', 'B3', 'B2'],
-};
-
-var paletteVis =  ['#c51b7d','#e9a3c9','#fde0ef','#e6f5d0','#a1d76a','#4d9221'];
-
-var paletteClassif = ['#b35806','#f1a340','#fee0b6','#d8daeb','#998ec3','#542788'];
-
-var forestsVis = {
-  classification: ['1'], 
-  palette: ['green']
-};
-
 
 //Filter the ROI
 //************************************************************************** 
@@ -89,7 +58,7 @@ var gcps = eucalyptus2018.merge(otherBroadleaves2018).merge(corkOak2018).merge(h
 var bands = ['B2','B3','B4','B5','B6',
 'B7','B8','B8A',
 'B11','B12',
-'ndvi','mndwi', 'elev','slope'];
+'ndvi','savi', 'elev','slope'];
 
 
 // Selection of bands of interest and clip to geometry
@@ -164,37 +133,17 @@ var test = classifiedMasked.sampleRegions({
 
 var confusionMatrix = test.errorMatrix('landcover', 'classification');
 
-print('Confusion Matrix SVM', confusionMatrix);
-print('Test Accuracy SVM:', confusionMatrix.accuracy());
+print('Confusion Matrix SVM 2018 forest types', confusionMatrix);
 
 
 // Evaluation metrics calculation
-//**************************************************************************
-print('Producers Accuracy SVM:', confusionMatrix.producersAccuracy());
-print('Consumers Accuracy SVM:', confusionMatrix.consumersAccuracy());
-print('Kappa SVM:', confusionMatrix.kappa());
-
-
-// Accuracy evaluation results export as CSV
 //************************************************************************** 
-var fc = ee.FeatureCollection([
-  ee.Feature(null, {
-    'Confusion Matrix SVM': confusionMatrix.accuracy(),
-    'Test Accuracy SVM': confusionMatrix.array(),
-    'Producers Accuracy SVM': confusionMatrix.producersAccuracy(),
-    'Consumers Accuracy SVM': confusionMatrix.consumersAccuracy(),
-    'Kappa SVM': confusionMatrix.kappa()
-  })
-  ]);
 
+print('Accuracy SVM 2018:', confusionMatrix.accuracy());
+print('Precision SVM 2018:', confusionMatrix.precision());
+print('Recall SVM 2018:', confusionMatrix.recall());
+print('F1 score SVM 2018:', confusionMatrix.f1());
 
-Export.table.toDrive({
-  collection: fc,
-  description: 'accuracyExport_2aClassif_1ToM2018',
-  folder: 'earthEngine',
-  fileNamePrefix: 'accuracy_2aClassif_1ToM2018',
-  fileFormat: 'CSV'
-});
 
 
 
