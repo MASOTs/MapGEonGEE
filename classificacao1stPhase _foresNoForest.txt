@@ -1,47 +1,10 @@
-
-//=====================================================================================================================
-// MASOT - Mapeamento de Serviços de Ecossistema a partir de Observações da Terra
-
-// Land cover classification and accuracy assessment for forest and non-forest areas
-
-// 1st Phase - binary classification                                              
-
-//=====================================================================================================================
-
+Binary Classification:Land cover classification and accuracy assessment for forest and non-forest areas
 //This script does the following:
 // * Ingest Sentinel 2 image for 2018 (and 2022)
 // * Apply filters, masks and processes indices to compile all in a data-stack
-// * Performs a SVM classification with assessment of training accuracy
+// * Performs an SVM classification with an assessment of training accuracy
 // * Post-classification clean-up
-// * Exports results as assets and to the google drive
-
-//=====================================================================================================================
-
-
-
-///////////////////////////////////////////////////////////////
-//  * Map configuration                                      //
-///////////////////////////////////////////////////////////////
-
-Map.setCenter(-6.77, 41.80, 10);
-Map.setOptions('satellite');
-
-// Visualization parameters
-//************************************************************************** 
-var rgbVis = {
-  min: 0.0,
-  max: 3000,
-  bands: ['B4', 'B3', 'B2'],
-};
-
-var ndviVis = {
-  min:0.7, 
-  max:1,
-  bands: ['ndvi'],
-  palette: ['white', 'green']
-};
-
-
+// * Exports results as assets and to the google drive};
 
 ///////////////////////////////////////////////////////////////
 //  * Sentinel-2 composite preparation for 2018              //
@@ -160,19 +123,11 @@ Export.image.toAsset({
   });
 */
 
-
-
 ///////////////////////////////////////////////////////////////
 //  * Data preparation for classification                    //
 ///////////////////////////////////////////////////////////////
 
 //print (dataStackNorm2018.bandNames());
-
-
-// NDVI index visualization
-//************************************************************************** 
-Map.addLayer(dataStackNorm2018.clip(ROI), ndviVis, 'NDVI 2018');
-
 
 // Joining training points
 //************************************************************************** 
@@ -214,8 +169,8 @@ var validationGcp = gcpsPoints.filter(ee.Filter.gte('random', 0.7));
 // Sample assembly to run the model
 //************************************************************************** 
 var training = image.sampleRegions({
-  collection: trainingGcp, // conjunto de dados para treino
-  properties: ['landcover'], // propriedade usada
+  collection: trainingGcp, // training dataset
+  properties: ['landcover'], // targer
   scale: 10,
   tileScale: 16
 });
@@ -261,36 +216,68 @@ var test = classified.sampleRegions({
 var confusionMatrix = test.errorMatrix('landcover', 'classification');
 
 print('Confusion Matrix SVM 2018', confusionMatrix);
-print('Test Accuracy SVM 2018:', confusionMatrix.accuracy());
+
 
 // Evaluation metrics calculation
 //************************************************************************** 
-print('Producers Accuracy SVM 2018:', confusionMatrix.producersAccuracy());
-print('Consumers Accuracy SVM 2018:', confusionMatrix.consumersAccuracy());
-print('Kappa SVM 2018:', confusionMatrix.kappa());
+
+print('Accuracy SVM 2018:', confusionMatrix.accuracy());
+print('Precision SVM 2018:', confusionMatrix.precision());
+print('Recall SVM 2018:', confusionMatrix.recall());
+print('F1 score SVM 2018:', confusionMatrix.f1());
 
 
-// Accuracy evaluation results export as CSV
-//************************************************************************** 
-var fc = ee.FeatureCollection([
-  ee.Feature(null, {
-    'Confusion Matrix SVM': confusionMatrix.accuracy(),
-    'Test Accuracy SVM': confusionMatrix.array(),
-    'Producers Accuracy SVM': confusionMatrix.producersAccuracy(),
-    'Consumers Accuracy SVM': confusionMatrix.consumersAccuracy(),
-    'Kappa SVM': confusionMatrix.kappa()
-  })
-]);
+///////////////////////////////////////////////////////////////
+// * Hyperparameters tuning                                  //
+///////////////////////////////////////////////////////////////
 
-Export.table.toDrive({
-  collection: fc,
-  description: 'Accuracy_Export_2018_SVM',
-  folder: 'earthEngine',
-  fileNamePrefix: 'accuracy_2018_svm',
-  fileFormat: 'CSV'
+
+// Define the range of values for the hyperparameters
+//**************************************************************************
+var kernelTypes = ['linear', 'poly', 'rbf', 'sigmoid'];
+var gammas = [0.1, 1, 10];
+var costs = [1, 10, 100];
+
+
+// Perform hyperparameter tuning
+//**************************************************************************
+var accuracies = [];
+for (var i = 0; i < kernelTypes.length; i++) {
+  for (var j = 0; j < gammas.length; j++) {
+    for (var k = 0; k < costs.length; k++) {
+      var classifier = ee.Classifier.libsvm({
+        kernelType: kernelTypes[i],
+        gamma: gammas[j],
+        cost: costs[k]
+      }).train({
+        features: training,
+        classProperty: 'landcover',
+        inputProperties: bands
+      });
+
+      var validationClassified = validationGcp.classify(classifier);
+      var errorMatrix = validationGcp.errorMatrix('landcover', 'classification');
+      var accuracy = errorMatrix.accuracy();
+
+      accuracies.push({
+        kernelType: kernelTypes[i],
+        gamma: gammas[j],
+        cost: costs[k],
+        accuracy: accuracy
+      });
+    }
+  }
+}
+
+// Sort the accuracies based on the accuracy value
+//**************************************************************************
+accuracies.sort(function(a, b) {
+  return b.accuracy - a.accuracy;
 });
 
-
+// Print the best hyperparameters and accuracy
+//**************************************************************************
+print('Best Hyperparameters:', accuracies[0]);
 
 //************************************************************************** 
 // Post process by clustering
